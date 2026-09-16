@@ -19,7 +19,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 import capture_learning
-from capture_learning import main
+from capture_learning import TokenExpiredError, main
 from lib.reflect_utils import DENY_PATTERNS
 
 ALLOW_IDENTITY = "github.com/ajmarkow/nix-components"
@@ -74,10 +74,10 @@ def hook_env(stub, origin, prompt, env_overrides=None):
         yield stub
 
 
-def run_hook(stub, origin, prompt, env_overrides=None):
+def run_hook(stub, origin, prompt, env_overrides=None, expect_code=0):
     with hook_env(stub, origin, prompt, env_overrides):
         code = main()
-    assert code == 0
+    assert code == expect_code, f"expected exit {expect_code}, got {code}"
     return stub
 
 
@@ -276,6 +276,56 @@ class TestEmittedItem(unittest.TestCase):
     def test_non_correction_posts_nothing(self):
         stub = run_hook(StubAPI(), ALLOW_ORIGIN, "Hello, how are you?")
         self.assertEqual(stub.posts, [])
+
+
+class TestExpiredTokenFailsLoud(unittest.TestCase):
+    """HTTP 401 from any API call -> exit 2 with a loud banner, never
+    silent exit 0. A dead token must never pass as quiet capture."""
+
+    class ExpiredAPI(StubAPI):
+        def __call__(self, path, token, payload=None):
+            raise TokenExpiredError(f"GitHub API {path} returned 401")
+
+    def test_401_on_repo_check_exits_2(self):
+        stub = run_hook(self.ExpiredAPI(), ALLOW_ORIGIN, CLEAN_PROMPT,
+                        expect_code=2)
+        self.assertEqual(stub.posts, [])
+
+    def test_401_on_issue_lookup_exits_2(self):
+        class Lookup401(StubAPI):
+            def __call__(self, path, token, payload=None):
+                if payload is None and "/issues?" in path:
+                    raise TokenExpiredError(f"GitHub API {path} returned 401")
+                return super().__call__(path, token, payload)
+        stub = run_hook(Lookup401(), ALLOW_ORIGIN, CLEAN_PROMPT,
+                        expect_code=2)
+        self.assertEqual(stub.posts, [])
+
+    def test_401_on_post_exits_2(self):
+        class Post401(StubAPI):
+            def __call__(self, path, token, payload=None):
+                if payload is not None:
+                    raise TokenExpiredError(f"GitHub API {path} returned 401")
+                return super().__call__(path, token, payload)
+        stub = run_hook(Post401(), ALLOW_ORIGIN, CLEAN_PROMPT,
+                        expect_code=2)
+        self.assertEqual(stub.posts, [])
+
+    def test_loud_message_names_token(self):
+        stderr = io.StringIO()
+        stdin = io.StringIO(json.dumps({"prompt": CLEAN_PROMPT}))
+        with patch("capture_learning._origin_url", return_value=ALLOW_ORIGIN), \
+                patch("capture_learning._github",
+                      side_effect=self.ExpiredAPI()), \
+                patch.object(capture_learning.sys, "stdin", stdin), \
+                patch.object(capture_learning.sys, "stderr", stderr):
+            for key in list(os.environ):
+                if key.startswith("REFLECT_"):
+                    del os.environ[key]
+            os.environ.update(BASE_ENV)
+            code = main()
+        self.assertEqual(code, 2)
+        self.assertIn("REFLECT_CAPTURE_TOKEN", stderr.getvalue())
 
 
 if __name__ == "__main__":

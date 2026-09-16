@@ -33,8 +33,10 @@ from lib.reflect_utils import (
 )
 
 try:
+    from urllib.error import HTTPError
     from urllib.request import Request, urlopen
 except ImportError:  # pragma: no cover - urllib is stdlib
+    HTTPError = None  # type: ignore
     Request = None  # type: ignore
     urlopen = None  # type: ignore
 
@@ -43,9 +45,22 @@ QUEUE_LABEL = "reflect-queue"
 HTTP_TIMEOUT = 3
 
 
+class TokenExpiredError(Exception):
+    """Raised when GitHub answers 401: the capture token is expired or
+    revoked. This fails LOUD (exit 2, blocks the prompt) so a dead token
+    can never pass as quiet capture. Everything else stays silent."""
+
+
 def _fail(reason: str) -> int:
     print(f"reflect: capture skipped: {reason}", file=sys.stderr)
     return 0
+
+
+def _fail_loud(reason: str) -> int:
+    print(f"reflect: CAPTURE TOKEN INVALID: {reason}", file=sys.stderr)
+    print("reflect: fix REFLECT_CAPTURE_TOKEN, then retry the prompt.",
+          file=sys.stderr)
+    return 2
 
 
 def _origin_url() -> 'str | None':
@@ -89,8 +104,16 @@ def _github(path: str, token: str, payload: 'object | None' = None) -> object:
         },
         method="POST" if payload is not None else "GET",
     )
-    with urlopen(request, timeout=HTTP_TIMEOUT) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        status = getattr(exc, "code", None)
+        if HTTPError is not None and isinstance(exc, HTTPError) and status == 401:
+            raise TokenExpiredError(
+                f"GitHub API {path} returned 401 — token expired or revoked."
+            ) from exc
+        raise
 
 
 def _find_queue_issue(repo: str, token: str) -> 'str | None':
@@ -101,6 +124,8 @@ def _find_queue_issue(repo: str, token: str) -> 'str | None':
                 f"/repos/{repo}/issues?state=open&labels={QUEUE_LABEL}&per_page=100&page={page}",
                 token,
             )
+        except TokenExpiredError:
+            raise
         except Exception as exc:
             print(f"reflect: queue issue lookup failed: {exc}", file=sys.stderr)
             return None
@@ -123,6 +148,8 @@ def _post_item(repo: str, token: str, issue_number: str, item: dict) -> bool:
             token,
             {"body": comment},
         )
+    except TokenExpiredError:
+        raise
     except Exception as exc:
         print(f"reflect: queue POST failed: {exc}", file=sys.stderr)
         return False
@@ -145,6 +172,8 @@ def main() -> int:
 
     try:
         repo_info = _github(f"/repos/{queue_repo}", capture_token)
+    except TokenExpiredError as exc:
+        return _fail_loud(str(exc))
     except Exception as exc:
         print(f"reflect: queue repo check failed: {exc}", file=sys.stderr)
         return 0
@@ -182,7 +211,10 @@ def main() -> int:
     if secret is not None:
         return _fail(f"deny-list hit ({secret})")
 
-    issue_number = _find_queue_issue(queue_repo, capture_token)
+    try:
+        issue_number = _find_queue_issue(queue_repo, capture_token)
+    except TokenExpiredError as exc:
+        return _fail_loud(str(exc))
     if issue_number is None:
         return _fail("queue issue not found")
     item = create_queue_item(
@@ -191,7 +223,10 @@ def main() -> int:
         patterns=patterns,
         confidence=confidence,
     )
-    _post_item(queue_repo, capture_token, issue_number, item)
+    try:
+        _post_item(queue_repo, capture_token, issue_number, item)
+    except TokenExpiredError as exc:
+        return _fail_loud(str(exc))
     return 0
 
 
