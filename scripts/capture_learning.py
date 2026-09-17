@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """Capture corrections from UserPromptSubmit and POST one item to the queue issue.
 
-Flow: allowlist check -> read prompt -> detect_patterns -> deny list ->
-one POST to the private queue issue. Fail-closed throughout: any config,
-identity, privacy, or API problem exits 0 without posting.
+Flow: read prompt -> detect_patterns -> deny list -> one POST to the
+private queue issue. Fail-closed throughout: any config, privacy, or API
+problem exits 0 without posting.
 
 Env (see PLAN.md):
   REFLECT_QUEUE_REPO     queue repo in `owner/name` form; must be private.
   REFLECT_CAPTURE_TOKEN  GitHub token with `issues: write` on the queue repo.
-  REFLECT_CAPTURE_REPOS  allowlist of exact `host/owner/name` repo identities.
-                         Empty or unset captures nothing.
+
+Fires in every repo the hook runs in. The `repo_identity` field labels
+the item with the repo the correction was typed in; it is never a
+capture gate. The secret deny lists (client and server) are the privacy
+control; there is deliberately no per-repo allowlist here.
 
 No stdout: UserPromptSubmit stdout is injected into the model context, and
 with no /reflect command there is nothing to act on. One stderr line on
 the paths that stay silent.
 """
+
 import json
 import os
 import subprocess
@@ -58,12 +62,11 @@ def _fail(reason: str) -> int:
 
 def _fail_loud(reason: str) -> int:
     print(f"reflect: CAPTURE TOKEN INVALID: {reason}", file=sys.stderr)
-    print("reflect: fix REFLECT_CAPTURE_TOKEN, then retry the prompt.",
-          file=sys.stderr)
+    print("reflect: fix REFLECT_CAPTURE_TOKEN, then retry the prompt.", file=sys.stderr)
     return 2
 
 
-def _origin_url() -> 'str | None':
+def _origin_url() -> "str | None":
     try:
         proc = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
@@ -86,13 +89,7 @@ def _origin_url() -> 'str | None':
         return None
 
 
-def _allowlisted(allowlist: str, identity: str) -> bool:
-    entries = [entry.strip().lower() for entry in allowlist.split(",")]
-    entries = [entry for entry in entries if entry]
-    return identity in entries
-
-
-def _github(path: str, token: str, payload: 'object | None' = None) -> object:
+def _github(path: str, token: str, payload: "object | None" = None) -> object:
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     request = Request(
         f"https://api.github.com{path}",
@@ -116,7 +113,7 @@ def _github(path: str, token: str, payload: 'object | None' = None) -> object:
         raise
 
 
-def _find_queue_issue(repo: str, token: str) -> 'str | None':
+def _find_queue_issue(repo: str, token: str) -> "str | None":
     page = 1
     while True:
         try:
@@ -159,16 +156,8 @@ def _post_item(repo: str, token: str, issue_number: str, item: dict) -> bool:
 def main() -> int:
     queue_repo = os.environ.get("REFLECT_QUEUE_REPO", "").strip()
     capture_token = os.environ.get("REFLECT_CAPTURE_TOKEN", "").strip()
-    capture_repos = os.environ.get("REFLECT_CAPTURE_REPOS", "")
-    if not queue_repo or not capture_token or not capture_repos.strip():
-        return _fail("missing REFLECT_QUEUE_REPO, REFLECT_CAPTURE_TOKEN, "
-                     "or REFLECT_CAPTURE_REPOS")
-
-    identity = normalize_repo_identity(_origin_url())
-    if identity is None:
-        return _fail("could not determine repo identity from origin remote")
-    if not _allowlisted(capture_repos, identity):
-        return _fail(f"repo identity {identity} is not allowlisted")
+    if not queue_repo or not capture_token:
+        return _fail("missing REFLECT_QUEUE_REPO or REFLECT_CAPTURE_TOKEN")
 
     try:
         repo_info = _github(f"/repos/{queue_repo}", capture_token)
@@ -223,6 +212,7 @@ def main() -> int:
         patterns=patterns,
         confidence=confidence,
     )
+    item["repo_identity"] = normalize_repo_identity(_origin_url())
     try:
         _post_item(queue_repo, capture_token, issue_number, item)
     except TokenExpiredError as exc:

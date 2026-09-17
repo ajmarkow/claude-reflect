@@ -60,8 +60,8 @@ archiving** — outward-facing and not trivially undone.
 
 Flow:
 
-1. **Capture** — a correction in an allowlisted repo becomes one JSON item on
-   the private queue issue.
+1. **Capture** — a correction in any repo the hook runs in becomes one
+   JSON item on the private queue issue, labelled with its repo identity.
 2. **Propose** (daily cron) — the model turns pending items into replacement
    content, committed to a branch in the **private** queue repo and opened as
    a PR there. Nothing public is touched.
@@ -113,19 +113,20 @@ Note what repo visibility does **not** tell you: a public repo's source says
 nothing about what a prompt typed in its session contains. No repo is safe to
 capture from on the grounds that its code is already published.
 
-Four controls, all fail-closed. The first three reduce what gets captured and
-stored; none of them can recognise sensitive content with no distinctive shape
-— a customer name, an internal hostname. The fourth is what covers that case.
+Four controls, all fail-closed. None of them can recognise sensitive
+content with no distinctive shape — a customer name, an internal hostname.
+The human-approval control is what covers that case.
 
-### 1. Opt in per repo, keyed on remote identity
+### 1. Label every item with its repo identity
 
-`REFLECT_CAPTURE_REPOS` is a comma-separated allowlist managed in the
-home-manager module. Empty or unset captures nothing, so a host that gets the
-module without a list is inert.
+Derive a `host/owner/name` identity from the `origin` remote and attach it
+as `repo_identity` on the item. The identity is a label only — it never
+gates capture. Enforcement lives server-side (the n8n Trigger A allowlist
+decides what is stored).
 
-**Entries are `host/owner/name`, never a directory basename.** A basename is
-not an identity: any clone named `nix-components` — someone else's fork, a
-scratch copy — would match and start publishing its prompts.
+**Identities are `host/owner/name`, never a directory basename.** A basename
+is not an identity: any clone named `nix-components` — someone else's fork,
+a scratch copy — would collide.
 
 Derive the identity from the `origin` remote and normalize:
 
@@ -141,12 +142,8 @@ scp-like `git@host:owner/name` needs a regex. Strip userinfo, port, trailing
 internal GitLab `o/n` collide. Compare as exact full strings: no globs, no
 prefix matching, no bare `owner/name`.
 
-Fail closed on every ambiguity, each exiting 0 without posting: not inside a
-git work tree, no `origin` remote, an `origin` URL that does not parse to
-exactly one `host/owner/name`, or a local-path / `file://` origin.
-
-A renamed or transferred repo stops matching and capture stops. Re-add the new
-identity deliberately.
+A renamed or transferred repo changes the label on subsequent items; the
+server decides whether to keep storing them.
 
 ### 2. Refuse a public queue, at runtime
 
@@ -202,9 +199,11 @@ So approval happens entirely inside the private queue repo, and it is a
 
 ## Capture hook
 
-Trim `scripts/capture_learning.py` to: check the allowlist, read the prompt
-from stdin, run `detect_patterns`, run the deny list, and on a clean hit POST
-one comment to the queue issue containing a single fenced JSON block.
+Trim `scripts/capture_learning.py` to: read the prompt from stdin, run
+`detect_patterns`, run the deny list, label with `repo_identity`, and on a
+clean hit POST one comment to the queue issue containing a single fenced
+JSON block. Capture fires in every repo the hook runs in; the server-side
+allowlist decides what is stored.
 
 **The item schema must match what `process_queue.py` reads.** The current
 `create_queue_item` output has no `id`, and `extract_items` silently drops any
@@ -219,21 +218,19 @@ anywhere. Emit:
   "patterns": "<short label>",
   "type": "auto",
   "confidence": 0.8,
-  "status": "pending"
+  "status": "pending",
+  "repo_identity": "github.com/ajmarkow/nix-components"
 }
 ```
 
-Drop `sentiment`, `decay_days`, and the absolute-path `project` field. Drop
-`source_project` too: only allowlisted repos can appear, and nothing downstream
-reads it.
+Drop `sentiment`, `decay_days`, and the absolute-path `project` field.
 
 **Config:**
 
-| Env var                 | Purpose                                                                |
-| ----------------------- | ---------------------------------------------------------------------- |
-| `REFLECT_QUEUE_REPO`    | Queue repo in `owner/name` form. Must be private; checked at runtime.  |
-| `REFLECT_CAPTURE_TOKEN` | GitHub token with `issues: write` on the queue repo only.              |
-| `REFLECT_CAPTURE_REPOS` | Allowlist of exact `host/owner/name`. Empty or unset captures nothing. |
+| Env var                 | Purpose                                                               |
+| ----------------------- | --------------------------------------------------------------------- |
+| `REFLECT_QUEUE_REPO`    | Queue repo in `owner/name` form. Must be private; checked at runtime. |
+| `REFLECT_CAPTURE_TOKEN` | GitHub token with `issues: write` on the queue repo only.             |
 
 The queue issue title and label are constants (`reflect queue`,
 `reflect-queue`), not config.
@@ -374,19 +371,10 @@ Add `tests/test_privacy.py`, with the network call stubbed so a regression
 fails a test rather than posting for real:
 
 - Every deny-list pattern, one realistic case each → no POST.
-- Unset `REFLECT_CAPTURE_REPOS` → no POST. Identity off the list → no POST.
-  Identity on the list → POST.
-- **Identity collision** — two repos whose directories share a basename but
-  whose `origin` remotes differ; only the allowlisted one posts.
-- **Normalization** — scp-like, `https://`, and `ssh://` forms of one remote
-  resolve to one identity, with `.git`, userinfo, port, trailing slash, and
-  case all normalized away.
-- **Unusable identity** → no POST: outside a work tree, no `origin`,
-  unparseable URL, `file://` origin.
-- **Near misses** → no POST: a fork under another owner, the same `owner/name`
-  on another host, a name that is a prefix or suffix of an allowlisted one.
+- Missing queue repo or token → no POST. A clean correction → POST.
 - Queue repo reporting `private: false` → no POST, no override.
-- The emitted item carries no absolute path in any field.
+- The emitted item carries an `id`, a `repo_identity` label, and no
+  absolute path in any field.
 
 In `reflect-queue-test`, with the GitHub API and model client stubbed:
 
@@ -414,11 +402,10 @@ In `reflect-queue-test`, with the GitHub API and model client stubbed:
      `block-ssh-rg-cd.sh` and `rtk-rewrite.sh` are.
    - `modules/claude-code/settings.nix` — add a `UserPromptSubmit` block to
      `programs.claude-code.settings.hooks`. Only `PreToolUse` exists today.
-3. **The module ships inert.** `REFLECT_CAPTURE_REPOS` defaults to empty.
-   Populate it with one entry and leave it a week before adding more;
-   `github.com/ajmarkow/nix-components` is a reasonable first choice, because
-   its sessions concern Nix config rather than customer or production data.
-   The entry is the full identity, not `nix-components`.
+3. **The module ships inert.** `nix-components.reflect.enable` defaults to
+   false. When enabling, start with one host and read the first week's
+   items by hand — the deny list cannot catch sensitive content with no
+   secret shape.
 4. **No workflow file here.** Both phases live in the queue repo.
 5. **Deployment is not automatic.** nix-components is a component flake; its
    `check.yml` runs `nix flake check` and builds packages, it does not deploy.
@@ -472,17 +459,16 @@ Real, not hypothetical. Fix before the cron runs.
 Steps 1 and 2 gate everything downstream.
 
 1. `python3 -m pytest tests/` passes, including all of `tests/test_privacy.py`.
-2. **Leak drill against the real queue, before any host deploys.** With the
-   allowlist naming only the current repo:
+2. **Leak drill against the real queue, before any host deploys.**
    - `echo '{"prompt":"no, use sk-ant-api03-AAAA... not the old key"}' | python3 scripts/capture_learning.py`
      → exit 0 and **no new comment**. Confirm by reading the issue, not by
      trusting the exit code.
-   - From a repo not on the allowlist → no comment.
    - `REFLECT_QUEUE_REPO` pointed at any public repo → no comment, plus an
      explicit stderr line.
-3. With a clean prompt → a fenced JSON comment appears with an `id` and no
-   absolute path. Unset `REFLECT_QUEUE_REPO` → one stderr line, exit 0, no
-   comment, session unaffected.
+3. With a clean prompt → a fenced JSON comment appears with an `id`, a
+   `repo_identity` label, and no absolute path. Unset
+   `REFLECT_QUEUE_REPO` → one stderr line, exit 0, no comment, session
+   unaffected.
 4. **Phase 1 drill.** Seed one clean item and one carrying a fake key, then run
    the workflow:
    - A proposal PR opens **in the queue repo**, and
@@ -497,8 +483,8 @@ Steps 1 and 2 gate everything downstream.
 6. `nix flake check --no-build` passes on that PR branch. Merge by hand. This
    is a **correctness** gate — the content is already public by now; step 5's
    merge was the privacy gate.
-7. After `deploy-nix-components` and each host's CI, a real correction in an
-   allowlisted repo lands on the queue issue. Read the first week's items by
-   hand before widening the allowlist, and check that week's proposals for
+7. After `deploy-nix-components` and each host's CI, a real correction in
+   any repo lands on the queue issue carrying its `repo_identity`. Read the
+   first week's items by hand, and check that week's proposals for
    sensitive content carrying no secret shape — the failure mode the deny
    lists cannot catch.

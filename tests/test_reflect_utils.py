@@ -5,6 +5,7 @@ Covers detect_patterns, create_queue_item (including the queue-item schema
 contract with process_queue.py), should_include_message,
 normalize_repo_identity, and find_secret.
 """
+
 import sys
 import unittest
 from pathlib import Path
@@ -133,8 +134,7 @@ class TestQueueItemSchema(unittest.TestCase):
 
         self.assertEqual(
             set(item.keys()),
-            {"id", "created_at", "message", "patterns", "type",
-             "confidence", "status"},
+            {"id", "created_at", "message", "patterns", "type", "confidence", "status"},
         )
         self.assertEqual(item["message"], "no, use postgres not sqlite")
         self.assertEqual(item["type"], "auto")
@@ -144,22 +144,28 @@ class TestQueueItemSchema(unittest.TestCase):
 
     def test_id_is_uuid4(self):
         item = create_queue_item(
-            message="no, use X", item_type="auto",
-            patterns="no,", confidence=0.8,
+            message="no, use X",
+            item_type="auto",
+            patterns="no,",
+            confidence=0.8,
         )
         parsed = UUID(item["id"], version=4)
         self.assertEqual(str(parsed), item["id"])
 
     def test_ids_unique(self):
-        kwargs = dict(message="no, use X", item_type="auto",
-                      patterns="no,", confidence=0.8)
-        self.assertNotEqual(create_queue_item(**kwargs)["id"],
-                            create_queue_item(**kwargs)["id"])
+        kwargs = dict(
+            message="no, use X", item_type="auto", patterns="no,", confidence=0.8
+        )
+        self.assertNotEqual(
+            create_queue_item(**kwargs)["id"], create_queue_item(**kwargs)["id"]
+        )
 
     def test_no_absolute_path_in_any_field(self):
         item = create_queue_item(
-            message="no, use X", item_type="auto",
-            patterns="no,", confidence=0.8,
+            message="no, use X",
+            item_type="auto",
+            patterns="no,",
+            confidence=0.8,
         )
         for key, value in item.items():
             self.assertNotIn("/home/", str(value), f"field {key}")
@@ -183,41 +189,51 @@ class TestShouldIncludeMessage(unittest.TestCase):
         self.assertFalse(should_include_message("   "))
 
     def test_xml_tag_excluded(self):
-        self.assertFalse(should_include_message(
-            "<task-notification>some content</task-notification>"))
-        self.assertFalse(should_include_message(
-            "<system-reminder>use X not Y</system-reminder>"))
+        self.assertFalse(
+            should_include_message(
+                "<task-notification>some content</task-notification>"
+            )
+        )
+        self.assertFalse(
+            should_include_message("<system-reminder>use X not Y</system-reminder>")
+        )
 
     def test_json_excluded(self):
         self.assertFalse(should_include_message('{"prompt": "no, use X"}'))
 
     def test_session_continuation_excluded(self):
-        self.assertFalse(should_include_message(
-            "This session is being continued from a previous conversation"
-        ))
+        self.assertFalse(
+            should_include_message(
+                "This session is being continued from a previous conversation"
+            )
+        )
 
     def test_system_reminder_with_correction_pattern(self):
-        msg = '<system-reminder>use context7 mcp every time, don\'t use old API</system-reminder>'
+        msg = "<system-reminder>use context7 mcp every time, don't use old API</system-reminder>"
         self.assertFalse(should_include_message(msg))
 
 
 class TestNormalizeRepoIdentity(unittest.TestCase):
-    """Origin URL -> host/owner/name normalization."""
+    """Origin URL -> host/owner/name label. Label only — capture fires in
+    every repo; nothing here gates on the result."""
 
     def test_scp_like(self):
         self.assertEqual(
             normalize_repo_identity("git@github.com:ajmarkow/nix-components.git"),
-            "github.com/ajmarkow/nix-components")
+            "github.com/ajmarkow/nix-components",
+        )
 
     def test_https(self):
         self.assertEqual(
             normalize_repo_identity("https://github.com/ajmarkow/nix-components"),
-            "github.com/ajmarkow/nix-components")
+            "github.com/ajmarkow/nix-components",
+        )
 
     def test_ssh_scheme(self):
         self.assertEqual(
             normalize_repo_identity("ssh://git@github.com/ajmarkow/nix-components.git"),
-            "github.com/ajmarkow/nix-components")
+            "github.com/ajmarkow/nix-components",
+        )
 
     def test_unusable_identities(self):
         self.assertIsNone(normalize_repo_identity(None))
@@ -269,7 +285,7 @@ class TestCaptureLearningFiltering(unittest.TestCase):
     """Filter layering: system content and long prompts blocked before POST."""
 
     def test_system_content_blocked_before_detect_patterns(self):
-        system_msg = '<system-reminder>use context7 mcp every time</system-reminder>'
+        system_msg = "<system-reminder>use context7 mcp every time</system-reminder>"
         self.assertFalse(should_include_message(system_msg))
 
         real_correction = "no, use gpt-5.1 not gpt-5"
@@ -277,14 +293,18 @@ class TestCaptureLearningFiltering(unittest.TestCase):
 
     def test_long_prompt_blocked(self):
         long_prompt = "a" * (MAX_CAPTURE_PROMPT_LENGTH + 1)
-        should_skip = len(long_prompt) > MAX_CAPTURE_PROMPT_LENGTH \
+        should_skip = (
+            len(long_prompt) > MAX_CAPTURE_PROMPT_LENGTH
             and "remember:" not in long_prompt.lower()
+        )
         self.assertTrue(should_skip)
 
     def test_long_prompt_with_remember_allowed(self):
         long_remember = "remember: " + "a" * MAX_CAPTURE_PROMPT_LENGTH
-        should_skip = len(long_remember) > MAX_CAPTURE_PROMPT_LENGTH \
+        should_skip = (
+            len(long_remember) > MAX_CAPTURE_PROMPT_LENGTH
             and "remember:" not in long_remember.lower()
+        )
         self.assertFalse(should_skip)
 
     def test_short_real_correction_passes_both_filters(self):

@@ -7,20 +7,24 @@ upstream v3.1.0. Everything else from upstream (file queue, memory
 routing, session scanning, semantic detection) was removed; see PLAN.md.
 
 Kept: `detect_patterns` and its pattern tables, `create_queue_item`,
-`should_include_message`, `MAX_CAPTURE_PROMPT_LENGTH` — plus the new
-repo-identity normalization and secret deny list the capture hook needs.
-All pure logic, no file I/O, no network.
+`should_include_message`, `MAX_CAPTURE_PROMPT_LENGTH`,
+`normalize_repo_identity` (labels the item with the repo it was typed
+in — enforcement lives server-side), plus the secret deny list the
+capture hook needs. All pure logic, no file I/O, no network.
 """
+
 import re
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 from urllib.parse import urlsplit
 
 
 # =============================================================================
 # Timestamp utilities
 # =============================================================================
+
 
 def iso_timestamp() -> str:
     """Get current UTC timestamp in ISO 8601 format."""
@@ -68,12 +72,37 @@ CORRECTION_PATTERNS = [
 # Format: (regex_pattern, pattern_name, confidence, decay_days)
 GUARDRAIL_PATTERNS = [
     (r"don't (?:add|include|create) .{1,40} unless", "dont-unless-asked", 0.90, 120),
-    (r"only (?:change|modify|edit|touch) what I (?:asked|requested|said)", "only-what-asked", 0.90, 120),
-    (r"stop (?:refactoring|changing|modifying|editing) (?:unrelated|other|surrounding)", "stop-unrelated", 0.90, 120),
-    (r"don't (?:over-engineer|add extra|be too|make unnecessary)", "dont-over-engineer", 0.85, 90),
-    (r"don't (?:refactor|reorganize|restructure) (?:unless|without)", "dont-refactor-unless", 0.85, 90),
+    (
+        r"only (?:change|modify|edit|touch) what I (?:asked|requested|said)",
+        "only-what-asked",
+        0.90,
+        120,
+    ),
+    (
+        r"stop (?:refactoring|changing|modifying|editing) (?:unrelated|other|surrounding)",
+        "stop-unrelated",
+        0.90,
+        120,
+    ),
+    (
+        r"don't (?:over-engineer|add extra|be too|make unnecessary)",
+        "dont-over-engineer",
+        0.85,
+        90,
+    ),
+    (
+        r"don't (?:refactor|reorganize|restructure) (?:unless|without)",
+        "dont-refactor-unless",
+        0.85,
+        90,
+    ),
     (r"leave .{1,30} (?:alone|unchanged|as is)", "leave-alone", 0.85, 90),
-    (r"don't (?:add|include) (?:comments|docstrings|type hints|annotations) (?:unless|to code)", "dont-add-annotations", 0.85, 90),
+    (
+        r"don't (?:add|include) (?:comments|docstrings|type hints|annotations) (?:unless|to code)",
+        "dont-add-annotations",
+        0.85,
+        90,
+    ),
     (r"(?:minimal|minimum|only necessary) changes", "minimal-changes", 0.80, 90),
 ]
 
@@ -93,15 +122,15 @@ FALSE_POSITIVE_PATTERNS = [
 # English phrases that look like correction openers but are NOT corrections
 # Especially important for CJK-mixed text where these appear naturally
 NON_CORRECTION_PHRASES = [
-    r"^no\s+problem",        # "No problem" - agreement
-    r"^no\s+worries",        # "No worries" - agreement
-    r"^no\s+need\b",         # "No need" - acknowledgment
-    r"^no\s+way\b",          # "No way!" - surprise/exclamation
-    r"^don't\s+worry",       # "Don't worry" - reassurance
-    r"^don't\s+mind",        # "Don't mind" - agreement
-    r"^don't\s+bother",      # "Don't bother" - polite decline
-    r"^never\s+mind",        # "Never mind" - dismissal
-    r"^stop\s+worrying",     # "Stop worrying" - reassurance
+    r"^no\s+problem",  # "No problem" - agreement
+    r"^no\s+worries",  # "No worries" - agreement
+    r"^no\s+need\b",  # "No need" - acknowledgment
+    r"^no\s+way\b",  # "No way!" - surprise/exclamation
+    r"^don't\s+worry",  # "Don't worry" - reassurance
+    r"^don't\s+mind",  # "Don't mind" - agreement
+    r"^don't\s+bother",  # "Don't bother" - polite decline
+    r"^never\s+mind",  # "Never mind" - dismissal
+    r"^stop\s+worrying",  # "Stop worrying" - reassurance
 ]
 
 # CJK correction patterns (parallel to English CORRECTION_PATTERNS)
@@ -109,21 +138,25 @@ NON_CORRECTION_PHRASES = [
 # Format: (regex_pattern, pattern_name, is_strong)
 CJK_CORRECTION_PATTERNS = [
     # Japanese
-    (r"^いや[、,.\s]|^いや違", "iya", True),       # いや、〜 / いや違う - "no, ..."
-    (r"^違う[、，,.\s！!。]|^ちがう[、,.\s]", "chigau", True),  # 違う、〜 - "wrong, ..."
+    (r"^いや[、,.\s]|^いや違", "iya", True),  # いや、〜 / いや違う - "no, ..."
+    (
+        r"^違う[、，,.\s！!。]|^ちがう[、,.\s]",
+        "chigau",
+        True,
+    ),  # 違う、〜 - "wrong, ..."
     (r"そうじゃなく[てけ]|そっちじゃなく[てけ]", "souja-nakute", True),  # "not that"
-    (r"間違[いえっ]て", "machigatte", True),       # 間違ってる - "it's wrong"
+    (r"間違[いえっ]て", "machigatte", True),  # 間違ってる - "it's wrong"
     (r"じゃなくて.{0,30}にして", "janakute-nishite", True),  # 〜じゃなくて〜にして
-    (r"^やめて[。！!]?\s*$", "yamete", True),      # やめて - "stop"
-    (r"^そうじゃない", "souja-nai", True),          # そうじゃない - "that's not right"
-    (r"って言った[のよでじゃ]", "tte-itta", True),   # って言ったのに - "I told you"
+    (r"^やめて[。！!]?\s*$", "yamete", True),  # やめて - "stop"
+    (r"^そうじゃない", "souja-nai", True),  # そうじゃない - "that's not right"
+    (r"って言った[のよでじゃ]", "tte-itta", True),  # って言ったのに - "I told you"
     # Chinese
-    (r"^不是[，,. ]", "bushi", True),              # 不是、〜 - "no, ..."
-    (r"^错了|^錯了", "cuole", True),               # 错了 - "wrong"
-    (r"不要.{0,20}要", "buyao-yao", True),         # 不要X要Y - "don't X, use Y"
+    (r"^不是[，,. ]", "bushi", True),  # 不是、〜 - "no, ..."
+    (r"^错了|^錯了", "cuole", True),  # 错了 - "wrong"
+    (r"不要.{0,20}要", "buyao-yao", True),  # 不要X要Y - "don't X, use Y"
     # Korean
-    (r"^아니[,. ]", "ani", True),                  # 아니, - "no, ..."
-    (r"틀렸", "teullyeoss", True),                 # 틀렸 - "wrong"
+    (r"^아니[,. ]", "ani", True),  # 아니, - "no, ..."
+    (r"틀렸", "teullyeoss", True),  # 틀렸 - "wrong"
 ]
 
 # Maximum prompt length for live capture (UserPromptSubmit hook)
@@ -154,7 +187,7 @@ def detect_patterns(text: str) -> Tuple[Optional[str], str, float, str, int]:
     # Too short to be actionable (e.g. "OK", "好", "yes")
     # CJK characters carry more meaning per char, so use a lower threshold
     stripped = text.strip()
-    has_cjk = bool(re.search(r'[\u3000-\u9fff\uf900-\ufaff\uac00-\ud7af]', stripped))
+    has_cjk = bool(re.search(r"[\u3000-\u9fff\uf900-\ufaff\uac00-\ud7af]", stripped))
     short_threshold = 2 if has_cjk else 4
     if len(stripped) <= short_threshold:
         return (None, "", 0.0, "correction", 90)
@@ -257,7 +290,13 @@ def detect_patterns(text: str) -> Tuple[Optional[str], str, float, str, int]:
         elif text_length > 150:
             confidence = max(0.55, confidence - 0.10)
 
-        return ("auto", " ".join(matched_corrections), confidence, "correction", decay_days)
+        return (
+            "auto",
+            " ".join(matched_corrections),
+            confidence,
+            "correction",
+            decay_days,
+        )
 
     return (None, "", 0.0, "correction", 90)
 
@@ -299,9 +338,9 @@ def should_include_message(text: str) -> bool:
 
     # Skip lines starting with certain patterns
     skip_patterns = [
-        r"^<",              # XML tags (<task-notification>, <system-reminder>, etc.)
-        r"^\[",             # Brackets
-        r"^\{",             # JSON
+        r"^<",  # XML tags (<task-notification>, <system-reminder>, etc.)
+        r"^\[",  # Brackets
+        r"^\{",  # JSON
         r"tool_result",
         r"tool_use_id",
         r"<command-",
@@ -309,8 +348,8 @@ def should_include_message(text: str) -> bool:
         r"<system-reminder>",
         r"This session is being continued",
         r"^Analysis:",
-        r"^\*\*",           # Bold text
-        r"^   -",           # Indented lists
+        r"^\*\*",  # Bold text
+        r"^   -",  # Indented lists
     ]
 
     for pattern in skip_patterns:
@@ -321,7 +360,7 @@ def should_include_message(text: str) -> bool:
 
 
 # =============================================================================
-# Repo identity: origin URL -> host/owner/name
+# Repo identity: origin URL -> host/owner/name (label only, no gating)
 # =============================================================================
 
 # scp-like syntax: [user@]host:owner/name — urlsplit cannot parse this form.
@@ -329,7 +368,10 @@ _SCP_LIKE_RE = re.compile(r"^(?:[^@/]+@)?([^:/\s]+):(.+)$")
 
 
 def normalize_repo_identity(origin_url: Optional[str]) -> Optional[str]:
-    """Normalize a git `origin` URL to an exact `host/owner/name` identity.
+    """Normalize a git `origin` URL to an exact `host/owner/name` label.
+
+    The identity labels the captured item with the repo the correction was
+    typed in. It is never a capture gate — enforcement lives server-side.
 
     Returns None for anything that does not parse to exactly one
     host/owner/name: local paths, `file://` origins, unparseable URLs,
@@ -396,10 +438,14 @@ DENY_PATTERNS: List[Tuple[str, "re.Pattern[str]"]] = [
     ("bearer-token", re.compile(r"(?i)\bbearer\s+[A-Za-z0-9\-._~+/=]{8,}")),
     ("private-key", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
     ("url-userinfo", re.compile(r"(?i)\bhttps?://[^/\s]+@")),
-    ("url-token-param",
-     re.compile(r"(?i)[?&](?:token|access_token|api_key|apikey|secret|key)=[^&\s]+")),
-    ("credential-assignment",
-     re.compile(r"(?i)(password|passwd|secret|token|api[_-]?key)\s*[:=]")),
+    (
+        "url-token-param",
+        re.compile(r"(?i)[?&](?:token|access_token|api_key|apikey|secret|key)=[^&\s]+"),
+    ),
+    (
+        "credential-assignment",
+        re.compile(r"(?i)(password|passwd|secret|token|api[_-]?key)\s*[:=]"),
+    ),
     ("long-hex-run", re.compile(r"\b[0-9a-fA-F]{32,}\b")),
     ("long-base64-run", re.compile(r"[A-Za-z0-9+/]{32,}={0,2}")),
 ]

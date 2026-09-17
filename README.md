@@ -1,7 +1,7 @@
 # claude-reflect (fork)
 
-Capture hook for the reflect pipeline. Detects a correction in an
-allowlisted repo and posts one JSON item to the private queue issue in
+Capture hook for the reflect pipeline. Detects a correction in any repo
+the hook runs in and posts one JSON item to the private queue issue in
 `REFLECT_QUEUE_REPO`, where the aggregator turns pending items into a
 reviewed proposal. See `PLAN.md`.
 
@@ -14,21 +14,19 @@ code (`detect_patterns` and its pattern tables in
 
 `scripts/capture_learning.py` runs on `UserPromptSubmit`:
 
-1. Check the repo allowlist (`REFLECT_CAPTURE_REPOS`).
-2. Read the prompt from stdin, run `detect_patterns`.
-3. Run the secret deny list; on a hit, post nothing.
-4. POST one comment with a single fenced JSON block to the queue issue
+1. Read the prompt from stdin, run `detect_patterns`.
+2. Run the secret deny list; on a hit, post nothing.
+3. POST one comment with a single fenced JSON block to the queue issue
    (`reflect queue` / `reflect-queue`).
 
 ## Config
 
-| Env var                 | Purpose                                                 |
-| ----------------------- | ------------------------------------------------------- |
-| `REFLECT_QUEUE_REPO`    | Queue repo in `owner/name` form. Must be private.       |
-| `REFLECT_CAPTURE_TOKEN` | GitHub token with `issues: write` on the queue repo.    |
-| `REFLECT_CAPTURE_REPOS` | Allowlist of exact `host/owner/name`. Empty captures nothing. |
+| Env var                 | Purpose                                              |
+| ----------------------- | ---------------------------------------------------- |
+| `REFLECT_QUEUE_REPO`    | Queue repo in `owner/name` form. Must be private.    |
+| `REFLECT_CAPTURE_TOKEN` | GitHub token with `issues: write` on the queue repo. |
 
-Fail-closed: missing config, off-list identity, non-private queue, or
+Fail-closed: missing config, non-private queue, or
 API error means one stderr line and exit 0. No stdout — `UserPromptSubmit`
 stdout is injected into the model context and there is nothing to act on.
 

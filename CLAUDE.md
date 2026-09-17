@@ -6,18 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 claude-reflect (fork of BayramAnnakov/claude-reflect v3.1.0) is the capture
 half of the reflect pipeline: `scripts/capture_learning.py` runs on
-`UserPromptSubmit`, detects a correction in an allowlisted repo, and POSTs
-one JSON item to the private queue issue. The aggregator (queue issue,
-model call, proposal PR, publish step) lives in a separate repo. See
-`PLAN.md`.
+`UserPromptSubmit`, detects a correction in any repo the hook runs in, and
+POSTs one JSON item to the private queue issue. The aggregator (queue
+issue, model call, proposal PR, publish step) lives in a separate repo.
+See `PLAN.md`.
 
 ## Architecture
 
 ```
 hooks/hooks.json          → Hook definition (UserPromptSubmit only)
-scripts/capture_learning.py → Allowlist check, detect, deny list, one POST
+scripts/capture_learning.py → Detect, deny list, one POST
 scripts/lib/reflect_utils.py → detect_patterns + tables, create_queue_item,
-                               should_include_message, repo identity, deny list
+                               should_include_message, deny list
 tests/                    → pytest suite
 ```
 
@@ -37,7 +37,7 @@ Copyright (c) 2025 Bayram Annakov). `LICENSE` stays.
 ## Development Commands
 
 ```bash
-# Test capture hook with simulated input (allowlist + token required for a POST;
+# Test capture hook with simulated input (queue repo + token required for a POST;
 # without them the hook exits 0 having posted nothing)
 echo '{"prompt":"no, use gpt-5.1 not gpt-5"}' | python3 scripts/capture_learning.py
 
@@ -47,8 +47,8 @@ python -m pytest tests/ -v
 
 ## Hook events
 
-| Hook | Script | Purpose |
-|------|--------|---------|
+| Hook             | Script                | Purpose                                    |
+| ---------------- | --------------------- | ------------------------------------------ |
 | UserPromptSubmit | `capture_learning.py` | Detect corrections and POST to queue issue |
 
 ## Detection
@@ -65,12 +65,10 @@ Confidence scores range 0.60-0.90 based on pattern strength and count.
 
 Four controls, all fail-closed:
 
-1. **Opt in per repo** — `REFLECT_CAPTURE_REPOS` allowlist of exact
-   `host/owner/name` identities derived from the `origin` remote.
+1. **Deny list** — drop on any secret-shaped match, do not mask.
 2. **Refuse a public queue at runtime** — abort unless the queue repo
    reports `private: true`.
-3. **Deny list** — drop on any secret-shaped match, do not mask.
-4. **Approval is a merge in the private queue repo** — never auto-publish.
+3. **Approval is a merge in the private queue repo** — never auto-publish.
 
 ## Platform Support
 
